@@ -130,6 +130,64 @@
     </section>
   </div>
 
+  <!-- TLS 握手配额与抢占回收演示 -->
+  <section class="card quota-card">
+    <div class="quota-heading">
+      <div>
+        <h2>TLS 握手共用配额与抢占回收</h2>
+        <p class="hint">
+          总共 <b>2</b> 个名额，IPv4/IPv6 各有 1 个本路名额，也可借用另一路的空闲名额。
+          名额在连接交给 HTTP 时释放；若尚未移交，则在 socket 实际关闭后释放。
+          两个名额被同一路占满后，另一入口的新 HTTPS 连接会中止一条未交给 HTTP 的连接，
+          并把名额预留给新连接；其它新连接直接 RST 拒绝。
+        </p>
+      </div>
+    </div>
+
+    <div class="quota-controls">
+      <label class="stack-select">
+        慢握手入口
+        <select id="slow-stack">
+          <option value="ipv4" selected>IPv4 · 127.0.0.1:{{ device_port }}</option>
+          <option value="ipv6">IPv6 · [::1]:{{ device_port }}</option>
+        </select>
+      </label>
+      <button id="btn-start-slow" class="btn-quota primary">① 发起两条本地慢握手</button>
+      <button id="btn-probe-other" class="btn-quota">② 从另一入口 HTTPS 探活</button>
+      <button id="btn-demo-quota" class="btn-quota accent">一键演示完整顺序</button>
+      <button id="btn-clear-slow" class="btn-quota ghost">清理慢连接</button>
+      <span id="quota-action-tip" class="saved-tip"></span>
+    </div>
+
+    <h3 class="probe-section-title">另一入口 HTTPS 探活结果</h3>
+    <div id="probe-banner" class="banner hidden"></div>
+    <pre id="probe-detail" class="probe-detail hidden"></pre>
+
+    <div class="quota-grid">
+      <div class="quota-left">
+        <div id="quota-summary" class="quota-summary"></div>
+        <div id="quota-slots" class="quota-slots"></div>
+
+        <h3>本地慢握手客户端（观察对端实际断开）</h3>
+        <div class="table-wrap">
+          <table class="slow-table">
+            <thead>
+              <tr><th>ID</th><th>入口</th><th>本地端口</th><th>状态</th><th>断开观察</th></tr>
+            </thead>
+            <tbody id="slow-clients-body">
+              <tr><td colspan="5" class="empty">尚未发起本地慢握手</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="quota-right">
+        <h3>名额 / 中止 / 实际断开顺序（按 seq）</h3>
+        <ol id="quota-events" class="quota-events"></ol>
+      </div>
+    </div>
+  </section>
+
   <!-- 历史 -->
   <section class="card history-card">
     <h2>设备执行记录（来自共用状态）</h2>

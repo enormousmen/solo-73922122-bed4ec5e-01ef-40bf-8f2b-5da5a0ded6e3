@@ -105,6 +105,7 @@
 
     // 健康点
     $("health-dot").className = "dot dot-ok";
+    renderQuota(state);
   }
 
   function refreshState() {
@@ -290,8 +291,237 @@
       });
   });
 
+  /* ---------------- TLS 配额 / 抢占演示 ---------------- */
+
+  var QUOTA_EVENT_LABELS = {
+    quota_acquired: "取得 TLS 握手名额",
+    quota_acquired_after_reclaim: "回收完成，新连接取得预留名额",
+    quota_released_http_handoff: "连接移交 HTTP，释放握手名额",
+    lease_actually_closed: "连接实际关闭，关闭顺序入账",
+    quota_rejected: "无可用名额，新连接被直接拒绝",
+    preempt_selected: "选中一条未移交 HTTP 的连接中止",
+    abort_signal_sent: "已发出 shutdown/RST 中止信号",
+    preempted_handshake_won_race: "抢占已先生效，禁止该连接移交 HTTP",
+    preempted_completed_handshake_denied_http: "被中止连接完成握手，但仍不得处理请求",
+    reclamation_complete: "旧名额回收并预留给新连接",
+    slow_client_tcp_connected: "本地慢握手 TCP 已连接",
+    slow_client_actually_disconnected: "慢握手客户端观察到对端实际断开",
+    slow_client_connect_failed: "慢握手客户端连接失败",
+    health_probe_start: "另一入口 HTTPS 探活开始",
+    health_probe_tcp_connected: "探活 TCP 已连接（可能在等待回收名额）",
+    health_probe_tls_connected: "探活 TLS 握手完成",
+    health_probe_result: "HTTPS 探活结果",
+    health_probe_client_closed: "探活客户端已关闭"
+  };
+
+  var LEASE_STATE_LABELS = {
+    handshaking: "TLS 握手中/慢握手保持",
+    aborting: "抢占中止中",
+    handed_off: "已移交 HTTP",
+    closed: "已实际关闭"
+  };
+
+  function quotaEventKind(ev) {
+    if (ev.event === "quota_rejected" || ev.event === "slow_client_connect_failed" ||
+        (ev.event === "health_probe_result" && ev.ok === false)) return "bad";
+    if (ev.event === "lease_actually_closed" || ev.event === "abort_signal_sent" ||
+        ev.event === "preempt_selected" || ev.event === "reclamation_complete") return "warn";
+    if (ev.event === "quota_released_http_handoff" ||
+        ev.event === "quota_acquired_after_reclaim" ||
+        ev.event === "health_probe_tls_connected" ||
+        (ev.event === "health_probe_result" && ev.ok === true)) return "ok";
+    return "";
+  }
+
+  function renderQuota(state) {
+    var q = state.quota;
+    if (!q || !$("quota-summary")) return;
+
+    var reservation = q.reservation
+      ? '<span class="quota-reserved">回收预留：' + q.reservation.stack.toUpperCase() +
+        " → permit " + q.reservation.permit.toUpperCase() + "</span>"
+      : "";
+    $("quota-summary").innerHTML =
+      '<div class="qstat"><span>名额占用</span><b>' + q.occupied + " / " + q.total + '</b></div>' +
+      '<div class="qstat"><span>IPv4 占用</span><b class="v4">' + (q.by_stack.ipv4 || 0) + '</b></div>' +
+      '<div class="qstat"><span>IPv6 占用</span><b class="v6">' + (q.by_stack.ipv6 || 0) + '</b></div>' +
+      '<div class="qstat"><span>拒绝 / 抢占</span><b>' + q.counts.rejected + " / " + q.counts.preempted + '</b></div>' +
+      reservation;
+
+    $("quota-slots").innerHTML = q.slots.map(function (slot) {
+      if (!slot.occupied || !slot.lease) {
+        return '<div class="slot-card free"><div class="slot-title">' +
+          slot.permit.toUpperCase() + ' 本路名额</div><div class="slot-state">空闲</div></div>';
+      }
+      var l = slot.lease;
+      var classes = "slot-card occupied stack-" + l.stack + (l.preempted ? " preempted" : "");
+      return '<div class="' + classes + '">' +
+        '<div class="slot-title">' + slot.permit.toUpperCase() + " 本路名额" +
+          (l.borrowed ? '<span class="tag-borrow">被 ' + l.stack.toUpperCase() + " 借用</span>" : "") +
+        "</div>" +
+        '<div class="slot-line">' + stackPill(l.stack) +
+          "<strong>#" + l.id + "</strong>" +
+          (l.preempted ? '<span class="tag-preempt">已选中止</span>' : "") +
+        "</div>" +
+        '<div class="slot-state">' + escapeHtml(LEASE_STATE_LABELS[l.state] || l.state) + "</div>" +
+        '<div class="slot-meta">peer_port=' + escapeHtml(l.peer_port || "-") +
+          " · " + (l.age_ms / 1000).toFixed(1) + "s</div>" +
+      "</div>";
+    }).join("");
+
+    var clients = state.traffic_clients || [];
+    var body = $("slow-clients-body");
+    if (!clients.length) {
+      body.innerHTML = '<tr><td colspan="5" class="empty">尚未发起本地慢握手</td></tr>';
+    } else {
+      body.innerHTML = clients.map(function (c) {
+        var stateClass = c.state === "disconnected" ? "client-off" :
+          (c.state === "failed" ? "client-failed" : "client-on");
+        return "<tr class='" + stateClass + "'>" +
+          "<td class='mono'>" + escapeHtml(c.id.slice(-10)) + "</td>" +
+          "<td>" + stackPill(c.stack) + "</td>" +
+          "<td class='mono'>" + escapeHtml(c.local_port || "–") + "</td>" +
+          "<td>" + escapeHtml(c.state) + "</td>" +
+          "<td class='mono small'>" + escapeHtml(c.disconnect_reason || c.error || "保持中") + "</td>" +
+        "</tr>";
+      }).join("");
+    }
+
+    var events = (q.events || []).slice(-45);
+    $("quota-events").innerHTML = events.map(function (e) {
+      var label = QUOTA_EVENT_LABELS[e.event] || e.event;
+      var keys = ["stack", "victim_stack", "lease_id", "new_lease_id", "permit", "reason",
+        "ok", "http_status", "elapsed_ms", "handshake_ms", "local_port", "client_id", "error"];
+      var details = keys.filter(function (k) {
+        return e[k] !== undefined && e[k] !== null && e[k] !== "";
+      }).map(function (k) {
+        var v = String(e[k]);
+        if (v.length > 90) v = v.slice(0, 90) + "…";
+        return k + "=" + v;
+      });
+      return "<li class='qevent kind-" + quotaEventKind(e) + "'>" +
+        "<span class='qseq'>#" + e.seq + "</span>" +
+        "<span class='qt'>+" + e.t_ms + "ms</span>" +
+        (e.stack ? "<span class='st st-" + e.stack + "'>" + e.stack + "</span>"
+                 : "<span class='st st-system'>sys</span>") +
+        "<span class='qev'>" + escapeHtml(label) + "</span>" +
+        (details.length ? "<span class='qdetail'>" + escapeHtml(details.join(" · ")) + "</span>" : "") +
+      "</li>";
+    }).join("");
+    var box = $("quota-events");
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function selectedSlowStack() {
+    return $("slow-stack").value === "ipv6" ? "ipv6" : "ipv4";
+  }
+
+  function otherStack(stack) {
+    return stack === "ipv4" ? "ipv6" : "ipv4";
+  }
+
+  function updateProbeButtonLabel() {
+    var target = otherStack(selectedSlowStack());
+    $("btn-probe-other").textContent = "② 从另一入口 HTTPS 探活（" + target.toUpperCase() + "）";
+  }
+
+  function setQuotaTip(text, isError) {
+    var tip = $("quota-action-tip");
+    tip.textContent = text || "";
+    tip.style.color = isError ? "var(--bad)" : "var(--ok)";
+  }
+
+  function renderProbe(probe) {
+    var banner = $("probe-banner");
+    var detail = $("probe-detail");
+    banner.classList.remove("hidden", "running", "delivered", "not_sent", "unknown");
+    if (probe.ok) {
+      banner.classList.add("delivered");
+      banner.innerHTML = "<span>✓</span><div><b>" + probe.stack.toUpperCase() +
+        " HTTPS 探活成功</b><span class='sub'>HTTP " + probe.http_status +
+        " · 总耗时 " + probe.elapsed_ms + "ms · TLS " + (probe.tls_ms == null ? "–" : probe.tls_ms) +
+        "ms；若触发抢占，事件列表中可看到完整回收顺序。</span></div>";
+    } else {
+      banner.classList.add("not_sent");
+      banner.innerHTML = "<span>✕</span><div><b>" + probe.stack.toUpperCase() +
+        " HTTPS 探活失败/被拒绝</b><span class='sub'>阶段 " + escapeHtml(probe.stage || "?") +
+        " · 耗时 " + probe.elapsed_ms + "ms · " + escapeHtml(probe.error || "unknown") +
+        "</span></div>";
+    }
+    detail.classList.remove("hidden");
+    detail.textContent = JSON.stringify(probe, null, 2);
+  }
+
+  var quotaBusy = false;
+  function withQuotaButtonsDisabled(busy) {
+    ["btn-start-slow", "btn-probe-other", "btn-demo-quota", "btn-clear-slow"].forEach(function (id) {
+      $(id).disabled = busy;
+    });
+  }
+
+  function startSlowHandshakes() {
+    if (quotaBusy) return Promise.resolve();
+    quotaBusy = true;
+    withQuotaButtonsDisabled(true);
+    var stack = selectedSlowStack();
+    setQuotaTip("正在 " + stack.toUpperCase() + " 建立两条本地慢握手…");
+    return api("/api/demo/slow-handshakes", {
+      method: "POST",
+      body: JSON.stringify({ stack: stack, count: 2, replace: true })
+    }).then(function (data) {
+      renderState(data.state);
+      setQuotaTip("两条 " + stack.toUpperCase() + " 慢握手已占满两个名额（含借用另一路）。");
+    }).catch(function (err) {
+      setQuotaTip("发起慢握手失败：" + err.message, true);
+    }).finally(function () {
+      quotaBusy = false;
+      withQuotaButtonsDisabled(false);
+    });
+  }
+
+  function runOtherProbe() {
+    if (quotaBusy) return Promise.resolve();
+    quotaBusy = true;
+    withQuotaButtonsDisabled(true);
+    var target = otherStack(selectedSlowStack());
+    var banner = $("probe-banner");
+    banner.classList.remove("hidden", "delivered", "not_sent", "unknown");
+    banner.classList.add("running");
+    banner.textContent = "正在从 " + target.toUpperCase() + " 发起 HTTPS 探活；满额时先中止并回收一条慢握手…";
+    return api("/api/demo/probe", {
+      method: "POST",
+      body: JSON.stringify({ stack: target, timeout_s: 8 })
+    }).then(function (data) {
+      renderProbe(data.probe);
+      renderState(data.state);
+    }).catch(function (err) {
+      banner.classList.remove("running");
+      banner.classList.add("unknown");
+      banner.textContent = "探活控制台请求失败：" + err.message;
+    }).finally(function () {
+      quotaBusy = false;
+      withQuotaButtonsDisabled(false);
+      refreshState();
+    });
+  }
+
+  $("slow-stack").addEventListener("change", updateProbeButtonLabel);
+  $("btn-start-slow").addEventListener("click", startSlowHandshakes);
+  $("btn-probe-other").addEventListener("click", runOtherProbe);
+  $("btn-demo-quota").addEventListener("click", function () {
+    startSlowHandshakes().then(function () {
+      return new Promise(function (resolve) { setTimeout(resolve, 250); });
+    }).then(runOtherProbe);
+  });
+  $("btn-clear-slow").addEventListener("click", function () {
+    api("/api/demo/clear-slow", { method: "POST" })
+      .then(function (data) { renderState(data.state); setQuotaTip("本地慢连接已清理。"); })
+      .catch(function (err) { setQuotaTip("清理失败：" + err.message, true); });
+  });
+  updateProbeButtonLabel();
+
   /* ---------------- 启动 ---------------- */
   syncExplain();
   refreshState();
-  setInterval(refreshState, 2500);
+  setInterval(refreshState, 1000);
 })();

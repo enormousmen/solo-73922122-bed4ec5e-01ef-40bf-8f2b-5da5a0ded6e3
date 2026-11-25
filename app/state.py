@@ -9,6 +9,8 @@ import time
 from collections import deque
 from typing import Any
 
+from .quota import QuotaManager
+
 MODE_OK = "ok"
 MODE_STALL = "stall"   # 接受 TCP 后卡住 TLS 握手
 MODE_RESET = "reset"   # 接受后立即 RST/关闭，制造“提前失败”
@@ -29,6 +31,8 @@ class DeviceState:
         self.execution_delay = execution_delay
         self.started_at = time.time()
         self._lock = threading.RLock()
+        # IPv4/IPv6 两个管理入口共享的 TLS 握手配额（总共 2 个名额）。
+        self.quota = QuotaManager(total=2)
         self.reload_count = 0
         self.stack_count = {"ipv4": 0, "ipv6": 0}
         self.settings: dict[str, Any] = {
@@ -89,7 +93,7 @@ class DeviceState:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return {
+            data = {
                 "device_name": self.device_name,
                 "reload_count": self.reload_count,
                 "stack_count": dict(self.stack_count),
@@ -98,3 +102,6 @@ class DeviceState:
                 "uptime_s": round(time.time() - self.started_at, 1),
                 "history": list(reversed(self._history)),
             }
+        # QuotaManager 有自己的锁，避免持有 DeviceState 锁时进入配额状态机。
+        data["quota"] = self.quota.snapshot()
+        return data
